@@ -93,6 +93,7 @@ def search_best_sync(
     similarity_threshold: float,
     min_candidate_sim: float = 0.30,
     top_k: int = 5,
+    embedding_version: str = "arcface_r100_v1",
 ) -> Tuple[Optional[str], str, float]:
     """
     Synchronous cosine search across all person_embeddings rows.
@@ -101,6 +102,9 @@ def search_best_sync(
     A match is returned only when best_sim >= similarity_threshold.
     Callers should treat 0.40–0.54 as "probable" and surface the
     candidate panel for operator confirmation.
+
+    Only compares against embeddings of the same version to prevent
+    cross-model comparisons (e.g. 128-dim face-api.js vs 512-dim ArcFace).
     """
     from sqlalchemy import text
 
@@ -109,8 +113,10 @@ def search_best_sync(
             "SELECT pe.person_id::text AS pid, p.name, pe.embedding_vec "
             "FROM person_embeddings pe "
             "JOIN persons p ON p.id = pe.person_id "
-            "WHERE p.active = true"
-        )
+            "WHERE p.active = true "
+            "AND pe.embedding_version = :emb_version"
+        ),
+        {"emb_version": embedding_version},
     ).fetchall()
 
     query = _l2_normalize(np.array(embedding, dtype=np.float32))
@@ -128,7 +134,7 @@ def search_best_sync(
 
     if best_sim >= similarity_threshold:
         return best_pid, best_name, best_sim
-    return None, "Unknown", best_sim   # return actual sim so caller can decide
+    return None, "Unknown", best_sim
 
 
 def search_candidates_sync(
@@ -136,6 +142,7 @@ def search_candidates_sync(
     embedding: List[float],
     min_candidate_sim: float = 0.30,
     top_k: int = 5,
+    embedding_version: str = "arcface_r100_v1",
 ) -> List[Dict[str, Any]]:
     """
     Return top-K persons by cosine similarity for the candidate panel.
@@ -143,6 +150,8 @@ def search_candidates_sync(
     min_candidate_sim=0.30 avoids flooding the panel with noise.
     Based on ArcFace angle distributions, genuine pairs rarely fall
     below 0.35 even for extreme pose, so 0.30 provides a safe buffer.
+
+    Only compares against embeddings of the same version.
     """
     from sqlalchemy import text
 
@@ -151,8 +160,10 @@ def search_candidates_sync(
             "SELECT pe.person_id::text AS pid, p.name, pe.embedding_vec "
             "FROM person_embeddings pe "
             "JOIN persons p ON p.id = pe.person_id "
-            "WHERE p.active = true"
-        )
+            "WHERE p.active = true "
+            "AND pe.embedding_version = :emb_version"
+        ),
+        {"emb_version": embedding_version},
     ).fetchall()
 
     query = _l2_normalize(np.array(embedding, dtype=np.float32))
@@ -173,10 +184,13 @@ async def search_best_async(
     db,
     embedding: List[float],
     similarity_threshold: float,
+    embedding_version: str = "arcface_r100_v1",
 ) -> Tuple[Optional[str], str, float]:
     """
     Async cosine search. `db` is an AsyncSession.
     Returns (person_id | None, name, best_cosine_similarity).
+
+    Only compares against embeddings of the same version.
     """
     from sqlalchemy import text
 
@@ -185,8 +199,10 @@ async def search_best_async(
             "SELECT pe.person_id::text AS pid, p.name, pe.embedding_vec "
             "FROM person_embeddings pe "
             "JOIN persons p ON p.id = pe.person_id "
-            "WHERE p.active = true"
-        )
+            "WHERE p.active = true "
+            "AND pe.embedding_version = :emb_version"
+        ),
+        {"emb_version": embedding_version},
     )
     rows = result.fetchall()
 

@@ -3,18 +3,16 @@ recognition.py
 ──────────────
 REST endpoints for facial recognition and person management.
 
-Key improvements based on ArcFace / VGGFace2 papers:
-  • Enrollment stores per-angle embeddings PLUS a L2-normalised template
-    embedding (mean of all angles) following the VGGFace2 template-
-    aggregation strategy (Cao et al., 2018).
-  • Recognition always re-normalises embeddings before search to guard
-    against client-submitted non-unit vectors.
-  • The /enroll endpoint returns the confidence tier so the UI can warn
-    when only one frontal photo was provided.
+Changes from original:
+  - Replaced _get_models() with insightface_service singleton.
+  - All embeddings stored with embedding_type + embedding_version.
+  - Browser enrollment REJECTS 128-dim face-api.js embeddings (dimension mismatch).
+  - Consistent cosine similarity metric everywhere.
 """
 from __future__ import annotations
 
 import io
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -29,14 +27,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import get_db_dep
 from app.models import Person, PersonEmbedding
+from app.services.insightface_service import get_insightface_service, EMBEDDING_DIM, EMBEDDING_VERSION
 
 router = APIRouter(prefix="/api/recognition", tags=["recognition"])
 
 
 @router.get("/health")
 async def recognition_health():
+    svc = get_insightface_service()
     return {
         "status": "ok",
+        "model_loaded": svc.is_ready,
+        "embedding_dim": EMBEDDING_DIM,
+        "embedding_version": EMBEDDING_VERSION,
         "similarity_threshold": settings.similarity_threshold,
         "candidate_min_sim": settings.candidate_min_sim,
     }
@@ -51,7 +54,7 @@ class BBox(BaseModel):
     height: int
     name: str
     confidence: float
-    confidence_tier: str = "low"   # "high" | "moderate" | "low"
+    confidence_tier: str = "low"
     quality: float = 0.0
     angle: str = "frontal"
 
@@ -68,21 +71,6 @@ class PersonOut(BaseModel):
     active: bool
     embedding_count: int
     created_at: str
-
-
-# ── Lazy model loader ──────────────────────────────────────────────────────────
-
-_detector = None
-_embedder = None
-
-
-def _get_models():
-    global _detector, _embedder
-    if _detector is None:
-        from app.utils.gpu_utils import build_detector, build_embedder
-        _detector = build_detector()
-        _embedder = build_embedder(_detector)
-    return _detector, _embedder
 
 
 # ── Embedding helpers ──────────────────────────────────────────────────────────
@@ -109,7 +97,10 @@ async def _search_person(
     db: AsyncSession, embedding: List[float]
 ) -> tuple[Optional[str], str, float]:
     from app.utils.vector_search import search_best_async
-    return await search_best_async(db, embedding, settings.similarity_threshold)
+    return await search_best_async(
+        db, embedding, settings.similarity_threshold,
+        embedding_version=EMBEDDING_VERSION,
+    )
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -132,8 +123,8 @@ async def recognize_image(
         img_bgr, settings.camera_resize_width, settings.camera_resize_height
     )
 
-    detector, embedder = _get_models()
-    faces = detector.detect(img_bgr)
+    svc = get_insightface_service()
+    faces = svc.detect_faces(img_bgr, max_faces=settings.max_faces_per_frame)
     bboxes: List[BBox] = []
 
     for face in faces:
@@ -144,11 +135,9 @@ async def recognize_image(
         if quality < 0.1:
             continue
 
-        embedding = embedder.embed(face.crop)
-        # Ensure unit norm (ArcFace should already output this, but guard anyway)
-        emb_norm = _l2_normalize(np.array(embedding, dtype=np.float32)).tolist()
+        embedding = svc.extract_embedding(face.crop)
 
-        _, name, confidence = await _search_person(db, emb_norm)
+        _, name, confidence = await _search_person(db, embedding)
         tier = _classify_tier(confidence, name)
         angle = angle_hint_from_yaw(yaw)
         x, y = face.bbox[0], face.bbox[1]
@@ -200,18 +189,14 @@ async def register_person(
 ) -> PersonOut:
     """
     Register a person with one or more photos.
-    Multiple photos at different angles dramatically improve recognition
-    (VGGFace2 paper shows cross-pose similarity drops ~15–20% with
-    single-angle enrollment).
-
-    A L2-normalised template embedding (mean of all angle embeddings) is
-    also stored (angle_hint="template") for fast single-shot retrieval.
+    Uses the InsightFace singleton for detection + embedding.
+    Stores embedding_type and embedding_version for each embedding.
     """
     import cv2
     import json as _json
     from app.utils.face_quality import composite_quality, angle_hint_from_yaw
 
-    detector, embedder = _get_models()
+    svc = get_insightface_service()
     person = Person(name=name)
     db.add(person)
     await db.flush()
@@ -223,7 +208,7 @@ async def register_person(
         img = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-        faces = detector.detect(img_bgr)
+        faces = svc.detect_faces(img_bgr, max_faces=1)
         if not faces:
             continue
 
@@ -233,14 +218,13 @@ async def register_person(
             face.crop, face.kps, w, h, face.det_score
         )
         angle_hint = angle_hint_from_yaw(yaw)
-        raw_emb = embedder.embed(face.crop)
-        embedding = _l2_normalize(
-            np.array(raw_emb, dtype=np.float32)
-        ).tolist()
+        embedding = svc.extract_embedding(face.crop)
 
         db.add(PersonEmbedding(
             person_id=person.id,
             embedding_vec=_json.dumps(embedding),
+            embedding_type="arcface",
+            embedding_version=EMBEDDING_VERSION,
             angle_hint=angle_hint,
             quality_score=quality,
         ))
@@ -259,6 +243,8 @@ async def register_person(
         db.add(PersonEmbedding(
             person_id=person.id,
             embedding_vec=_json.dumps(template_emb),
+            embedding_type="arcface",
+            embedding_version=EMBEDDING_VERSION,
             angle_hint="template",
             quality_score=1.0,
         ))
@@ -292,7 +278,7 @@ async def add_photos(
     if not person:
         raise HTTPException(status_code=404, detail="Person not found.")
 
-    detector, embedder = _get_models()
+    svc = get_insightface_service()
     new_embeddings: List[List[float]] = []
 
     for upload in files:
@@ -300,7 +286,7 @@ async def add_photos(
         img = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-        faces = detector.detect(img_bgr)
+        faces = svc.detect_faces(img_bgr, max_faces=1)
         if not faces:
             continue
 
@@ -310,12 +296,13 @@ async def add_photos(
             face.crop, face.kps, w, h, face.det_score
         )
         angle_hint = angle_hint_from_yaw(yaw)
-        raw_emb = embedder.embed(face.crop)
-        embedding = _l2_normalize(np.array(raw_emb, dtype=np.float32)).tolist()
+        embedding = svc.extract_embedding(face.crop)
 
         db.add(PersonEmbedding(
             person_id=person.id,
             embedding_vec=_json.dumps(embedding),
+            embedding_type="arcface",
+            embedding_version=EMBEDDING_VERSION,
             angle_hint=angle_hint,
             quality_score=quality,
         ))
@@ -326,9 +313,10 @@ async def add_photos(
         existing_r = await db.execute(
             text(
                 "SELECT embedding_vec FROM person_embeddings "
-                "WHERE person_id = :pid AND angle_hint != 'template'"
+                "WHERE person_id = :pid AND angle_hint != 'template' "
+                "AND embedding_version = :ver"
             ),
-            {"pid": person_id},
+            {"pid": person_id, "ver": EMBEDDING_VERSION},
         )
         all_vecs = [
             _json.loads(row[0]) for row in existing_r.fetchall()
@@ -336,7 +324,6 @@ async def add_photos(
         if len(all_vecs) > 1:
             from app.utils.vector_search import compute_template_embedding
             template_emb = compute_template_embedding(all_vecs)
-            # Replace existing template
             await db.execute(
                 text(
                     "DELETE FROM person_embeddings "
@@ -347,6 +334,8 @@ async def add_photos(
             db.add(PersonEmbedding(
                 person_id=person.id,
                 embedding_vec=_json.dumps(template_emb),
+                embedding_type="arcface",
+                embedding_version=EMBEDDING_VERSION,
                 angle_hint="template",
                 quality_score=1.0,
             ))
@@ -384,6 +373,8 @@ class BrowserEnrollResponse(BaseModel):
     person_id: str
     name: str
     embedding_dim: int
+    embedding_type: str
+    embedding_version: str
     linkedin_url: Optional[str] = None
     instagram_handle: Optional[str] = None
     twitter_handle: Optional[str] = None
@@ -398,19 +389,28 @@ async def enroll_person_browser(
 ) -> BrowserEnrollResponse:
     """
     Register a person using a pre-computed face embedding from the browser.
-    The embedding is L2-normalised before storage to ensure ArcFace metric
-    compatibility regardless of the client-side model's output scale.
+
+    CRITICAL: Rejects embeddings that are not 512-dim.
+    face-api.js produces 128-dim embeddings which are INCOMPATIBLE with
+    ArcFace 512-dim embeddings. Mixing dimensions corrupts the search index.
     """
     import json as _json
 
-    emb = _l2_normalize(np.array(payload.embedding, dtype=np.float32)).tolist()
-    dim = len(emb)
-    warning = None
-    if dim != 512:
-        warning = (
-            f"Embedding dimension is {dim}, expected 512. "
-            "Recognition accuracy may be reduced."
+    dim = len(payload.embedding)
+
+    # HARD REJECT non-512 embeddings to prevent dimension mismatch corruption
+    if dim != EMBEDDING_DIM:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Embedding dimension is {dim}, expected {EMBEDDING_DIM}. "
+                f"face-api.js (128-dim) embeddings are incompatible with "
+                f"ArcFace (512-dim). Use the server-side /persons endpoint "
+                f"with photo uploads instead."
+            ),
         )
+
+    emb = _l2_normalize(np.array(payload.embedding, dtype=np.float32)).tolist()
 
     person = Person(
         name=payload.name,
@@ -425,6 +425,8 @@ async def enroll_person_browser(
     db.add(PersonEmbedding(
         person_id=person.id,
         embedding_vec=_json.dumps(emb),
+        embedding_type="arcface",
+        embedding_version=EMBEDDING_VERSION,
         angle_hint="frontal",
         quality_score=1.0,
     ))
@@ -434,11 +436,89 @@ async def enroll_person_browser(
         person_id=str(person.id),
         name=person.name,
         embedding_dim=dim,
+        embedding_type="arcface",
+        embedding_version=EMBEDDING_VERSION,
         linkedin_url=person.linkedin_url,
         instagram_handle=person.instagram_handle,
         twitter_handle=person.twitter_handle,
         notes=person.notes,
-        warning=warning,
+    )
+
+
+# ── Test endpoint ──────────────────────────────────────────────────────────────
+
+class TestResult(BaseModel):
+    faces: List[Dict[str, Any]]
+    matches: List[Dict[str, Any]]
+    latency_ms: float
+    model_version: str
+
+
+@router.post("/test", response_model=TestResult)
+async def recognition_test(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db_dep),
+) -> TestResult:
+    """
+    Diagnostic endpoint: detect faces, extract embeddings, search matches,
+    and return detailed results with latency breakdown.
+    """
+    import cv2
+    from app.utils.face_quality import composite_quality, angle_hint_from_yaw
+
+    t_start = time.monotonic()
+
+    contents = await file.read()
+    img = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    svc = get_insightface_service()
+
+    t_det = time.monotonic()
+    faces = svc.detect_faces(img_bgr, max_faces=settings.max_faces_per_frame)
+    detection_ms = (time.monotonic() - t_det) * 1000
+
+    face_results: List[Dict[str, Any]] = []
+    match_results: List[Dict[str, Any]] = []
+
+    for face in faces:
+        w, h = face.bbox[2], face.bbox[3]
+        quality, yaw, pitch, roll, _ = composite_quality(
+            face.crop, face.kps, w, h, face.det_score
+        )
+
+        t_emb = time.monotonic()
+        embedding = svc.extract_embedding(face.crop)
+        embedding_ms = (time.monotonic() - t_emb) * 1000
+
+        face_results.append({
+            "bbox": {"x": face.bbox[0], "y": face.bbox[1],
+                     "w": face.bbox[2], "h": face.bbox[3]},
+            "det_score": round(face.det_score, 4),
+            "quality": round(quality, 4),
+            "yaw": round(yaw, 1),
+            "pitch": round(pitch, 1),
+            "roll": round(roll, 1),
+            "angle": angle_hint_from_yaw(yaw),
+            "embedding_dim": len(embedding),
+            "embedding_ms": round(embedding_ms, 1),
+        })
+
+        pid, name, sim = await _search_person(db, embedding)
+        match_results.append({
+            "person_id": pid,
+            "name": name,
+            "similarity": round(sim, 4),
+            "tier": _classify_tier(sim, name),
+        })
+
+    total_ms = (time.monotonic() - t_start) * 1000
+
+    return TestResult(
+        faces=face_results,
+        matches=match_results,
+        latency_ms=round(total_ms, 1),
+        model_version=EMBEDDING_VERSION,
     )
 
 

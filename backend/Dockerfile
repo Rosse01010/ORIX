@@ -9,15 +9,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Install deps — API uses CPU onnxruntime (no GPU needed for on-demand recognition)
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
+
+# Model cache shared with worker via Docker volume
+RUN mkdir -p /app/models
 
 COPY app/ ./app/
 COPY workers/ ./workers/
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
+# Shared model cache — same path used by worker container
+ENV MODEL_CACHE=/app/models
+ENV INSIGHTFACE_HOME=/app/models
 
 EXPOSE 8000
 

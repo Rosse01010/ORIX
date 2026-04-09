@@ -79,6 +79,18 @@ class Settings(BaseSettings):
 
     min_face_size: int = 20
     detection_confidence: float = 0.50
+    max_faces_per_frame: int = 3
+
+    # ── Performance ───────────────────────────────────────────────────────────
+    frame_skip_interval: int = 2          # process every Nth frame (1 = every frame)
+    max_detection_width: int = 640        # resize frames before detection
+    max_detection_height: int = 640
+
+    # ── Latency control ──────────────────────────────────────────────────────
+    max_processing_time_ms: int = 200     # skip frame if exceeded
+
+    # ── Rate limiting ────────────────────────────────────────────────────────
+    api_rate_limit: int = 30              # max requests per minute per endpoint
 
     # ── GPU ────────────────────────────────────────────────────────────────────
     gpu_device_id: int = 0

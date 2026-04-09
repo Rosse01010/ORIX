@@ -62,8 +62,12 @@ class PersonEmbedding(Base):
     person_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("persons.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    # embedding stored as pgvector or JSON text depending on availability
-    embedding_vec: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    # Embedding stored as pgvector Vector(512) when available, JSON text fallback
+    embedding_vec = _embedding_column()
+    # Track which model produced this embedding to prevent cross-model comparisons
+    embedding_type: Mapped[str] = mapped_column(String(32), nullable=False, default="arcface")
+    # Specific model version — embeddings from different versions must not be mixed
+    embedding_version: Mapped[str] = mapped_column(String(64), nullable=False, default="arcface_r100_v1")
     angle_hint: Mapped[str] = mapped_column(String(32), default="frontal")
     quality_score: Mapped[float] = mapped_column(Float, default=1.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -1,6 +1,18 @@
 """
-Búsqueda de similitud vectorial en PostgreSQL con pgvector.
-Usa el operador <=> (distancia coseno) que aprovecha el índice IVFFLAT/HNSW.
+recognition_service.py
+──────────────────────
+pgvector-based facial recognition service.
+
+SIMILARITY STANDARDIZATION:
+  pgvector <=> operator returns cosine DISTANCE in [0, 2].
+  We convert to cosine SIMILARITY = 1 - distance, range [-1, 1].
+  All thresholds in config are expressed as cosine similarity.
+
+  This ensures the same metric is used everywhere:
+    - vector_search.py (numpy brute-force fallback)
+    - this service (pgvector)
+    - db_worker.py
+    - recognition routes
 """
 from __future__ import annotations
 
@@ -16,112 +28,119 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Tipo de retorno de find_match: (person_id, name, cosine_distance)
-MatchResult = Tuple[str, str, float]
+MatchResult = Tuple[str, str, float]  # (person_id, name, cosine_similarity)
 
 
 class RecognitionService:
     """
-    Servicio de reconocimiento facial sobre pgvector.
-    Todas las operaciones son async y requieren una AsyncSession de SQLAlchemy.
+    Facial recognition over pgvector.
+    All operations are async and require an AsyncSession.
     """
-
-    # ── Búsqueda ─────────────────────────────────────────────────────
 
     async def find_match(
         self,
         session: AsyncSession,
         embedding: np.ndarray,
         threshold: Optional[float] = None,
+        embedding_version: str = "arcface_r100_v1",
     ) -> Optional[MatchResult]:
         """
-        Busca la persona más similar al embedding dado usando distancia coseno.
+        Find the most similar person using pgvector cosine distance.
 
-        El operador <=> de pgvector retorna distancia coseno ∈ [0, 2]:
-          0   → idéntico
-          1   → ortogonal
-          2   → opuesto
+        pgvector <=> returns cosine distance in [0, 2]:
+          0 = identical, 1 = orthogonal, 2 = opposite
+
+        We convert: similarity = 1 - distance
+        And compare against the similarity threshold.
 
         Args:
-            session:   Sesión async de SQLAlchemy.
-            embedding: Vector L2-normalizado de 512 dims.
-            threshold: Distancia máxima aceptable (default: settings.SIMILARITY_THRESHOLD).
+            session:           Async SQLAlchemy session.
+            embedding:         L2-normalised 512-dim vector.
+            threshold:         Minimum cosine similarity for a match.
+            embedding_version: Only compare against embeddings of same version.
 
         Returns:
-            (person_id, name, distance) o None si no hay match dentro del umbral.
+            (person_id, name, cosine_similarity) or None.
         """
-        max_dist = threshold if threshold is not None else settings.SIMILARITY_THRESHOLD
+        min_sim = threshold if threshold is not None else settings.similarity_threshold
 
-        # pgvector espera el vector como string '[x1, x2, ...]'
         vec_str = "[" + ",".join(f"{v:.8f}" for v in embedding.tolist()) + "]"
 
+        # Filter by embedding_version to avoid cross-model comparisons.
+        # Convert pgvector cosine distance to similarity inline.
         query = text("""
-            SELECT id, name, (embedding <=> CAST(:vec AS vector)) AS distance
-            FROM persons
-            ORDER BY distance ASC
+            SELECT
+                pe.person_id,
+                p.name,
+                (1.0 - (pe.embedding_vec <=> CAST(:vec AS vector))) AS similarity
+            FROM person_embeddings pe
+            JOIN persons p ON p.id = pe.person_id
+            WHERE p.active = true
+              AND pe.embedding_version = :emb_version
+            ORDER BY pe.embedding_vec <=> CAST(:vec AS vector) ASC
             LIMIT 1
         """)
 
         try:
-            result = await session.execute(query, {"vec": vec_str})
+            result = await session.execute(query, {
+                "vec": vec_str,
+                "emb_version": embedding_version,
+            })
             row = result.fetchone()
         except Exception as exc:
-            logger.error(f"Error en búsqueda pgvector: {exc}")
+            logger.error(f"pgvector search error: {exc}")
             return None
 
         if row is None:
             return None
 
-        person_id, name, distance = row.id, row.name, float(row.distance)
+        person_id, name, similarity = str(row.person_id), row.name, float(row.similarity)
 
-        if distance > max_dist:
-            logger.debug(f"Sin match: distancia {distance:.4f} > umbral {max_dist}")
+        if similarity < min_sim:
+            logger.debug(f"No match: similarity {similarity:.4f} < threshold {min_sim}")
             return None
 
-        return person_id, name, distance
-
-    # ── Registro ─────────────────────────────────────────────────────
+        return person_id, name, similarity
 
     async def register_person(
         self,
         session: AsyncSession,
         name: str,
         embedding: np.ndarray,
+        embedding_version: str = "arcface_r100_v1",
     ) -> str:
-        """
-        Registra una nueva persona con su embedding en la base de datos.
-
-        Returns:
-            person_id (UUID) generado.
-        """
+        """Register a new person with their embedding."""
         person_id = str(uuid.uuid4())
         vec_str = "[" + ",".join(f"{v:.8f}" for v in embedding.tolist()) + "]"
 
         await session.execute(
             text("""
-                INSERT INTO persons (id, name, embedding, created_at)
-                VALUES (:id, :name, CAST(:vec AS vector), NOW())
+                INSERT INTO persons (id, name, created_at)
+                VALUES (:id, :name, NOW())
             """),
-            {"id": person_id, "name": name, "vec": vec_str},
+            {"id": person_id, "name": name},
+        )
+        await session.execute(
+            text("""
+                INSERT INTO person_embeddings
+                    (id, person_id, embedding_vec, embedding_type, embedding_version, created_at)
+                VALUES
+                    (gen_random_uuid(), :pid, CAST(:vec AS vector), 'arcface', :ver, NOW())
+            """),
+            {"pid": person_id, "vec": vec_str, "ver": embedding_version},
         )
         await session.commit()
 
-        logger.info(f"Persona registrada: '{name}' → {person_id}")
+        logger.info(f"Person registered: '{name}' -> {person_id}")
         return person_id
 
-    # ── Índice vectorial ─────────────────────────────────────────────
-
     async def ensure_index(self, session: AsyncSession) -> None:
-        """
-        Crea un índice IVFFLAT sobre el campo embedding si no existe.
-        Llamar tras insertar un volumen significativo de personas.
-        Ajustar `lists` según el número de filas (sqrt(N) es un buen default).
-        """
+        """Create IVFFLAT cosine index on person_embeddings.embedding_vec."""
         await session.execute(text("""
-            CREATE INDEX IF NOT EXISTS persons_embedding_idx
-            ON persons
-            USING ivfflat (embedding vector_cosine_ops)
+            CREATE INDEX IF NOT EXISTS person_embeddings_vec_idx
+            ON person_embeddings
+            USING ivfflat (embedding_vec vector_cosine_ops)
             WITH (lists = 100)
         """))
         await session.commit()
-        logger.info("Índice IVFFLAT creado/verificado en persons.embedding")
+        logger.info("IVFFLAT index created/verified on person_embeddings.embedding_vec")

@@ -61,6 +61,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-febrero13}@postgres:5432/${POSTGRES_DB:-ORIX_DB}
       REDIS_URL: redis://redis:6379/0
+      MODEL_CACHE: /app/models
+    volumes:
+      - model_cache:/app/models
     restart: unless-stopped
     networks:
       - orix_net
@@ -81,7 +84,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-febrero13}@postgres:5432/${POSTGRES_DB:-ORIX_DB}
       REDIS_URL: redis://redis:6379/0
     volumes:
-      - ./backend/models:/app/models:ro
+      - model_cache:/app/models
     deploy:
       resources:
         reservations:
@@ -109,6 +112,7 @@ services:
 
 volumes:
   postgres_data:
+  model_cache:
 
 networks:
   orix_net:

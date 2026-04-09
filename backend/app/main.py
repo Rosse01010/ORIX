@@ -76,6 +76,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Rate limiting on recognition endpoints to prevent CPU overload
+from app.middleware.rate_limit import RateLimitMiddleware
+app.add_middleware(RateLimitMiddleware)
+
+# ── Prometheus metrics endpoint ───────────────────────────────────────────────
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response as FastAPIResponse
+import app.utils.metrics  # noqa: F401 — register metrics on import
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics():
+    return FastAPIResponse(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 app.include_router(health_router.router)
 app.include_router(recognition_router.router)

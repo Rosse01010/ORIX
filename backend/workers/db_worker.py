@@ -5,11 +5,11 @@ Consumes vectors from stream:vectors, searches for matches across ALL
 embeddings grouped by person, logs detections, and publishes events to
 stream:events.
 
-Similarity thresholds (ArcFace cosine similarity, Deng et al. CVPR 2019):
-  ≥ settings.similarity_threshold  → auto-identify
-  settings.candidate_min_sim – threshold → uncertain, show candidate panel
-  |yaw| > settings.candidate_yaw_threshold → show panel even if "recognised"
-    (off-axis false accepts are a known failure mode per VGGFace2 paper)
+Production hardening:
+  - Filters search by embedding_version (prevents cross-model comparisons)
+  - Exponential backoff on Redis/PG reconnect
+  - Per-message timing logs
+  - Fault tolerance around DB operations
 """
 from __future__ import annotations
 
@@ -58,7 +58,8 @@ def _sync_db_url(url: str) -> str:
     return url.replace("postgresql+asyncpg://", "postgresql://")
 
 
-def _search_best(conn, embedding: List[float]) -> Tuple[Optional[str], str, float]:
+def _search_best(conn, embedding: List[float],
+                 embedding_version: str = "arcface_r100_v1") -> Tuple[Optional[str], str, float]:
     """Best single match using numpy cosine similarity (ArcFace metric)."""
     from app.utils.vector_search import search_best_sync
     return search_best_sync(
@@ -66,10 +67,12 @@ def _search_best(conn, embedding: List[float]) -> Tuple[Optional[str], str, floa
         embedding,
         settings.similarity_threshold,
         settings.candidate_min_sim,
+        embedding_version=embedding_version,
     )
 
 
-def _search_candidates(conn, embedding: List[float]) -> List[Dict[str, Any]]:
+def _search_candidates(conn, embedding: List[float],
+                       embedding_version: str = "arcface_r100_v1") -> List[Dict[str, Any]]:
     """Top-K candidate persons for the similarity panel."""
     from app.utils.vector_search import search_candidates_sync
     return search_candidates_sync(
@@ -77,6 +80,7 @@ def _search_candidates(conn, embedding: List[float]) -> List[Dict[str, Any]]:
         embedding,
         settings.candidate_min_sim,
         top_k=5,
+        embedding_version=embedding_version,
     )
 
 
@@ -123,24 +127,32 @@ def run() -> None:
         pool_size=5, max_overflow=10, pool_pre_ping=True,
     )
 
+    redis_retry_delay = 1
+    pg_retry_delay = 1
+
     while _running:
         try:
             results = rc.xreadgroup(
                 CONSUMER_GROUP, CONSUMER_NAME,
                 {in_s: ">"}, count=settings.db_worker_batch_size, block=500,
             )
+            redis_retry_delay = 1  # reset on success
+
             if not results:
                 continue
             with engine.begin() as conn:
+                pg_retry_delay = 1  # reset on success
                 for _, messages in results:
                     for msg_id, fields in messages:
                         _process(rc, conn, out_s, in_s, msg_id, fields)
         except redis.ConnectionError:
-            log.warning("db_worker_redis_reconnect")
-            time.sleep(2)
+            log.warning("db_worker_redis_reconnect", retry_in=redis_retry_delay)
+            time.sleep(redis_retry_delay)
+            redis_retry_delay = min(redis_retry_delay * 2, 30)
         except sqlalchemy.exc.OperationalError:
-            log.warning("db_worker_pg_reconnect")
-            time.sleep(3)
+            log.warning("db_worker_pg_reconnect", retry_in=pg_retry_delay)
+            time.sleep(pg_retry_delay)
+            pg_retry_delay = min(pg_retry_delay * 2, 30)
         except Exception as exc:
             log.exception("db_worker_error", error=str(exc))
             time.sleep(1)
@@ -153,6 +165,8 @@ def _process(rc, conn, out_stream, in_stream, msg_id, fields) -> None:
     timestamp  = fields.get("timestamp", "")
     faces_json = fields.get("faces_json", "[]")
 
+    t_start = time.monotonic()
+
     try:
         faces: List[Dict] = json.loads(faces_json)
         bboxes: List[Dict]          = []
@@ -161,6 +175,7 @@ def _process(rc, conn, out_stream, in_stream, msg_id, fields) -> None:
         for idx, face in enumerate(faces):
             bbox       = face["bbox"]
             embedding  = face["embedding"]
+            embedding_version = face.get("embedding_version", "arcface_r100_v1")
             quality    = face.get("quality", 1.0)
             yaw        = face.get("yaw", 0.0)
             pitch      = face.get("pitch", 0.0)
@@ -168,17 +183,18 @@ def _process(rc, conn, out_stream, in_stream, msg_id, fields) -> None:
             det_score  = face.get("det_score", 1.0)
             angle_hint = face.get("angle_hint", "frontal")
 
-            person_id, name, similarity = _search_best(conn, embedding)
+            person_id, name, similarity = _search_best(
+                conn, embedding, embedding_version=embedding_version,
+            )
             confidence = similarity if name != "Unknown" else det_score
 
-            _log_detection(conn, person_id, camera_id, confidence,
-                           quality, bbox, yaw, pitch, roll, timestamp)
+            try:
+                _log_detection(conn, person_id, camera_id, confidence,
+                               quality, bbox, yaw, pitch, roll, timestamp)
+            except Exception as exc:
+                log.warning("detection_log_error", error=str(exc))
 
             # ── Confidence tier classification ─────────────────────────────
-            # Based on ArcFace cosine similarity distributions:
-            #   ≥ 0.55 → high confidence
-            #   0.40–0.54 → moderate (flag for operator)
-            #   0.30–0.39 → low (always show candidates)
             if name != "Unknown" and similarity >= 0.55:
                 confidence_tier = "high"
             elif name != "Unknown" and similarity >= settings.similarity_threshold:
@@ -199,17 +215,14 @@ def _process(rc, conn, out_stream, in_stream, msg_id, fields) -> None:
             bboxes.append(bbox_out)
 
             # ── Candidate panel trigger ────────────────────────────────────
-            # Show panel when:
-            #   (a) face is Unknown (no match above threshold)
-            #   (b) match is "moderate" confidence (0.40–0.54)
-            #   (c) yaw is large enough to risk off-axis false accept
-            #       (VGGFace2: front-to-profile drops ~15–20% similarity)
             is_unknown    = name == "Unknown"
             is_moderate   = confidence_tier == "moderate"
             is_off_axis   = abs(yaw) > settings.candidate_yaw_threshold
 
             if is_unknown or is_moderate or is_off_axis:
-                candidates = _search_candidates(conn, embedding)
+                candidates = _search_candidates(
+                    conn, embedding, embedding_version=embedding_version,
+                )
                 if candidates:
                     candidates_list.append({
                         "face_index": idx,
@@ -219,6 +232,8 @@ def _process(rc, conn, out_stream, in_stream, msg_id, fields) -> None:
                         "yaw": round(yaw, 1),
                         "top_matches": candidates,
                     })
+
+        total_ms = (time.monotonic() - t_start) * 1000
 
         if bboxes:
             event_payload = {
@@ -234,6 +249,7 @@ def _process(rc, conn, out_stream, in_stream, msg_id, fields) -> None:
                 camera=camera_id,
                 faces=len(bboxes),
                 candidates=len(candidates_list),
+                total_ms=round(total_ms, 1),
             )
 
     except Exception as exc:

@@ -156,64 +156,16 @@ class InsightFaceEmbedder:
         return [0.0] * 512
 
 
-# ── MediaPipe fallback ─────────────────────────────────────────────────────────
-
-class MediaPipeDetector:
-    def __init__(self) -> None:
-        import mediapipe as mp
-        self._detector = mp.solutions.face_detection.FaceDetection(
-            model_selection=1,
-            min_detection_confidence=settings.detection_confidence,
-        )
-        log.info("mediapipe_detector_ready")
-
-    def detect(self, frame: np.ndarray) -> List[FaceDetection]:
-        import cv2
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        results = self._detector.process(rgb)
-        faces: List[FaceDetection] = []
-        if not results.detections:
-            return faces
-        for det in results.detections:
-            bb = det.location_data.relative_bounding_box
-            x = max(0, int(bb.xmin * w))
-            y = max(0, int(bb.ymin * h))
-            fw = int(bb.width * w)
-            fh = int(bb.height * h)
-            crop = cv2.resize(rgb[y:y+fh, x:x+fw], (112, 112)) if fw > 0 and fh > 0 else np.zeros((112, 112, 3), dtype=np.uint8)
-            score = det.score[0] if det.score else 0.0
-            faces.append(FaceDetection(bbox=[x, y, fw, fh], crop=crop, det_score=float(score)))
-        return faces
-
-
-class MediaPipeEmbedder:
-    def embed(self, aligned_crop: np.ndarray) -> List[float]:
-        import cv2
-        resized = cv2.resize(aligned_crop, (112, 112)).astype(np.float32) / 255.0
-        flat = resized.flatten()[:512]
-        norm = np.linalg.norm(flat)
-        return (flat / (norm + 1e-10)).tolist()
-
-
 # ── Public factories ───────────────────────────────────────────────────────────
+# MediaPipe fallback removed: it produced fake 512-dim pixel-mean embeddings
+# that are incompatible with ArcFace. InsightFace is the only supported backend.
 
 def build_detector() -> FaceDetector:
-    if settings.detector_backend.lower() == "insightface":
-        try:
-            return InsightFaceDetector()
-        except Exception as e:
-            log.warning("insightface_fallback", error=str(e))
-    log.info("using_mediapipe_detector")
-    return MediaPipeDetector()
+    """Build InsightFace SCRFD detector. Raises on failure (no silent fallback)."""
+    return InsightFaceDetector()
 
 
 def build_embedder(detector: Optional[object] = None) -> FaceEmbedder:
-    if settings.embedder_backend.lower() == "arcface":
-        try:
-            det = detector if isinstance(detector, InsightFaceDetector) else InsightFaceDetector()
-            return InsightFaceEmbedder(det)
-        except Exception as e:
-            log.warning("arcface_fallback", error=str(e))
-    log.info("using_mediapipe_embedder")
-    return MediaPipeEmbedder()
+    """Build ArcFace R100 embedder. Requires an InsightFaceDetector instance."""
+    det = detector if isinstance(detector, InsightFaceDetector) else InsightFaceDetector()
+    return InsightFaceEmbedder(det)

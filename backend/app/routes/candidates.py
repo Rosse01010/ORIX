@@ -70,6 +70,8 @@ async def confirm_identity(
     db.add(PersonEmbedding(
         person_id=person.id,
         embedding_vec=_json.dumps(body.embedding),
+        embedding_type="arcface",
+        embedding_version="arcface_r100_v1",
         angle_hint=body.angle_hint,
         quality_score=body.quality_score,
     ))
