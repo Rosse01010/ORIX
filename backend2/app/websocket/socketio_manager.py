@@ -92,11 +92,19 @@ async def on_ack_alert(sid: str, data: Dict[str, Any]) -> None:
 
 # ── Emit helpers (called by notifications relay) ───────────────────────────────
 
-async def emit_detection(camera_id: str, boxes: list) -> None:
+async def emit_detection(
+    camera_id: str,
+    boxes: list,
+    candidates: list | None = None,
+) -> None:
     """Broadcast detection bounding boxes to all subscribers of this camera."""
     await sio.emit(
         "detection-result",
-        {"cameraId": camera_id, "boxes": boxes},
+        {
+            "cameraId": camera_id,
+            "boxes": boxes,
+            "candidates": candidates or [],
+        },
         room=_room(camera_id),
     )
 

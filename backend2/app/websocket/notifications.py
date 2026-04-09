@@ -102,9 +102,10 @@ async def _handle_message(fields: Dict[str, str]) -> None:
 
         boxes = _transform_bboxes(bboxes)
 
-        # Emit detection boxes to subscribed clients
+        # Emit detection boxes + candidates to subscribed clients
+        candidates = payload.get("candidates", [])
         if boxes:
-            await emit_detection(camera_id, boxes)
+            await emit_detection(camera_id, boxes, candidates)
 
         # Emit alert for every unknown face detected
         unknown = [b for b in bboxes if b.get("name") == "Unknown"]
