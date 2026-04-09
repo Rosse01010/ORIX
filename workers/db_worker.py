@@ -24,7 +24,7 @@ from sqlalchemy import create_engine, text
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import settings
-from utils.logging_utils import configure_logging, get_logger
+from app.utils.logging_utils import configure_logging, get_logger
 
 log = get_logger(__name__)
 
@@ -64,14 +64,14 @@ def _sync_db_url(url: str) -> str:
 
 def _search_best(conn, embedding: List[float]) -> Tuple[Optional[str], str, float]:
     """Best single match across all embeddings using numpy cosine similarity."""
-    from utils.vector_search import search_best_sync
+    from app.utils.vector_search import search_best_sync
     return search_best_sync(conn, embedding, settings.similarity_threshold,
                             MIN_CANDIDATE_SIM, TOP_K_CANDIDATES)
 
 
 def _search_candidates(conn, embedding: List[float]) -> List[Dict[str, Any]]:
     """Top-K candidate persons for the similarity panel."""
-    from utils.vector_search import search_candidates_sync
+    from app.utils.vector_search import search_candidates_sync
     return search_candidates_sync(conn, embedding, MIN_CANDIDATE_SIM, TOP_K_CANDIDATES)
 
 

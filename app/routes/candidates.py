@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_dep
 from app.models import Person, PersonEmbedding
-from utils.logging_utils import get_logger
+from app.utils.logging_utils import get_logger
 
 log = get_logger(__name__)
 

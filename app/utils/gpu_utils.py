@@ -19,7 +19,7 @@ from typing import List, Optional, Protocol
 import numpy as np
 
 from app.config import settings
-from utils.logging_utils import get_logger
+from app.utils.logging_utils import get_logger
 
 log = get_logger(__name__)
 

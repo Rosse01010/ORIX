@@ -28,9 +28,9 @@ import redis
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import settings
-from utils.face_quality import composite_quality, angle_hint_from_yaw
-from utils.gpu_utils import build_detector, build_embedder
-from utils.logging_utils import configure_logging, get_logger
+from app.utils.face_quality import composite_quality, angle_hint_from_yaw
+from app.utils.gpu_utils import build_detector, build_embedder
+from app.utils.logging_utils import configure_logging, get_logger
 
 log = get_logger(__name__)
 

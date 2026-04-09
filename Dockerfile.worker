@@ -33,7 +33,6 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 # Copy source
 COPY app/ ./app/
-COPY utils/ ./utils/
 COPY workers/ ./workers/
 
 # Model cache directory
@@ -44,4 +43,4 @@ ENV PYTHONPATH=/app
 # Tell InsightFace where to cache models
 ENV INSIGHTFACE_HOME=/app/models
 
-CMD ["python", "workers/main_worker.py"]
+CMD ["python", "-m", "workers.main_worker"]

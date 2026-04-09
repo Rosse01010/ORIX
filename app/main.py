@@ -27,7 +27,7 @@ from app.seed import seed_all
 from app.websocket.manager import manager
 from app.websocket.notifications import relay_events_task
 from app.websocket.socketio_manager import sio
-from utils.logging_utils import configure_logging
+from app.utils.logging_utils import configure_logging
 
 log = get_logger(__name__)
 

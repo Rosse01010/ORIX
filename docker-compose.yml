@@ -1,5 +1,3 @@
-version: "3.9"
-
 x-common-env: &common-env
   env_file:
     - .env
@@ -50,7 +48,7 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: Dockerfile
     container_name: orix_api
     <<: *common-env
     ports:
@@ -83,7 +81,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-febrero13}@postgres:5432/${POSTGRES_DB:-ORIX_DB}
       REDIS_URL: redis://redis:6379/0
     volumes:
-      - ./models:/app/models
+      - ./models:/app/models:ro
     deploy:
       resources:
         reservations:
@@ -91,23 +89,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    restart: unless-stopped
-    networks:
-      - orix_net
-
-  # ─── React Frontend (Nginx) ──────────────────────────────────────────────────
-  frontend:
-    build:
-      context: ..
-      dockerfile: ORIX---Backend/backend2/Dockerfile.frontend
-      args:
-        VITE_API_URL: http://localhost:8000
-        VITE_SOCKET_URL: http://localhost:8000
-    container_name: orix_frontend
-    ports:
-      - "3000:80"
-    depends_on:
-      - api
     restart: unless-stopped
     networks:
       - orix_net

@@ -22,7 +22,7 @@ from typing import Callable, Dict, List
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import settings
-from utils.logging_utils import configure_logging, get_logger
+from app.utils.logging_utils import configure_logging, get_logger
 
 log = get_logger(__name__)
 

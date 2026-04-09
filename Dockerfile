@@ -11,18 +11,9 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir \
-        fastapi "uvicorn[standard]" python-multipart \
-        "python-socketio[asyncio]" websockets \
-        "sqlalchemy[asyncio]" asyncpg pgvector alembic \
-        "redis[hiredis]" \
-        "python-jose[cryptography]" "passlib[bcrypt]" \
-        pydantic-settings python-dotenv \
-        structlog prometheus-client httpx tenacity \
-        numpy Pillow
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
-COPY utils/ ./utils/
 COPY workers/ ./workers/
 
 ENV PYTHONUNBUFFERED=1

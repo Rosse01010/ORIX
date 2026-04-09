@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models import Camera, OrixUser
 from app.routes.auth import hash_password
-from utils.logging_utils import get_logger
+from app.utils.logging_utils import get_logger
 
 log = get_logger(__name__)
 

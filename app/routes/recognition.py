@@ -71,7 +71,7 @@ _embedder = None
 def _get_models():
     global _detector, _embedder
     if _detector is None:
-        from utils.gpu_utils import build_detector, build_embedder
+        from app.utils.gpu_utils import build_detector, build_embedder
         _detector = build_detector()
         _embedder = build_embedder(_detector)
     return _detector, _embedder
@@ -87,7 +87,7 @@ async def _search_person(
     Returns the person with the highest cosine similarity match.
     Uses numpy cosine similarity (pgvector fallback mode).
     """
-    from utils.vector_search import search_best_async
+    from app.utils.vector_search import search_best_async
     return await search_best_async(db, embedding, settings.similarity_threshold)
 
 
@@ -100,8 +100,8 @@ async def recognize_image(
     db: AsyncSession = Depends(get_db_dep),
 ) -> RecognitionResponse:
     """Synchronous recognition on a single uploaded image."""
-    from utils.face_quality import composite_quality, angle_hint_from_yaw
-    from utils.preprocessing import preprocess_frame
+    from app.utils.face_quality import composite_quality, angle_hint_from_yaw
+    from app.utils.preprocessing import preprocess_frame
 
     contents = await file.read()
     img = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
@@ -179,7 +179,7 @@ async def register_person(
     Register a person with one or more photos.
     Send multiple photos at different angles for best recognition.
     """
-    from utils.face_quality import composite_quality, angle_hint_from_yaw
+    from app.utils.face_quality import composite_quality, angle_hint_from_yaw
     import cv2
 
     detector, embedder = _get_models()
@@ -242,7 +242,7 @@ async def add_photos(
     db: AsyncSession = Depends(get_db_dep),
 ) -> Dict[str, Any]:
     """Add more photos (angles) to an existing person to improve recognition."""
-    from utils.face_quality import composite_quality, angle_hint_from_yaw
+    from app.utils.face_quality import composite_quality, angle_hint_from_yaw
     import cv2
 
     result = await db.execute(

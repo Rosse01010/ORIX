@@ -113,7 +113,7 @@ async def _listen_ws(duration: int = 30) -> None:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    from utils.logging_utils import configure_logging
+    from app.utils.logging_utils import configure_logging
     configure_logging("WARNING")
 
     # Seed DB
