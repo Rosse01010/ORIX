@@ -1,0 +1,52 @@
+# ═══════════════════════════════════════════════════════════════
+# Dockerfile.api  —  Contenedor de la API FastAPI
+# Sin GPU: sólo necesita Python, FastAPI y clientes de DB/Redis.
+# ═══════════════════════════════════════════════════════════════
+
+# ── Stage 1: instalación de dependencias ────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Dependencias del sistema necesarias para compilación
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ \
+        libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+
+# ── Stage 2: imagen final ────────────────────────────────────────
+FROM python:3.11-slim
+
+LABEL maintainer="surveillance-team"
+LABEL description="Surveillance API — FastAPI + WebSockets"
+
+WORKDIR /app
+
+# Runtime mínimo
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copiar dependencias compiladas
+COPY --from=builder /install /usr/local
+
+# Copiar sólo los módulos que la API necesita
+COPY app/ ./app/
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+EXPOSE 8000
+
+# Arrancar con 2 workers Uvicorn (ajustar según CPU disponible)
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "2", \
+     "--log-level", "info"]

@@ -1,0 +1,149 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════
+#  Variables de entorno compartidas por todos los servicios
+# ══════════════════════════════════════════════════════════════
+x-env: &env
+  DATABASE_URL:        postgresql+asyncpg://surv:surv_pass@postgres:5432/surveillance
+  DATABASE_SYNC_URL:   postgresql://surv:surv_pass@postgres:5432/surveillance
+  REDIS_URL:           redis://redis:6379
+  REDIS_STREAM_KEY:    face:embeddings
+  REDIS_ALERT_CHANNEL: face:alerts
+  REDIS_CONSUMER_GROUP: db-workers
+  FACENET_MODEL_PATH:  /app/models/facenet_model.h5
+  EMBEDDING_DIM:       "512"
+  SIMILARITY_THRESHOLD: "0.6"
+  GPU_BATCH_SIZE:      "16"
+  GPU_BATCH_TIMEOUT_MS: "50"
+  FRAME_SKIP:          "5"
+  FRAME_WIDTH:         "640"
+  FRAME_HEIGHT:        "480"
+  # ⚠ Reemplazar con URLs reales de las cámaras
+  RTSP_URLS: "rtsp://user:pass@192.168.1.10:554/stream,rtsp://user:pass@192.168.1.11:554/stream"
+
+
+services:
+
+  # ────────────────────────────────────────────────────────────
+  # PostgreSQL 16 con extensión pgvector
+  # ────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: surv-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     surv
+      POSTGRES_PASSWORD: surv_pass
+      POSTGRES_DB:       surveillance
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U surv -d surveillance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ────────────────────────────────────────────────────────────
+  # Redis 7 (Streams + Pub/Sub)
+  # ────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: surv-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # ────────────────────────────────────────────────────────────
+  # API FastAPI  (sin GPU, imagen liviana)
+  # ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: surv-api
+    restart: unless-stopped
+    environment:
+      <<: *env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/recognition/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ────────────────────────────────────────────────────────────
+  # Worker principal: cámaras RTSP + GPU FaceNet
+  # Requiere nvidia-container-toolkit en el host.
+  # ────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: surv-worker
+    restart: unless-stopped
+    environment:
+      <<: *env
+    command: python -m workers.main_worker
+    volumes:
+      - ./models:/app/models:ro
+    ipc: host          # necesario para mp.Queue con CUDA (spawn method)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # ── GPU NVIDIA ──────────────────────────────────────────
+    # Descomentar para habilitar acceso a GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ────────────────────────────────────────────────────────────
+  # DB Worker: consumer Redis Streams → pgvector → alertas
+  # Se puede escalar horizontalmente:
+  #   docker compose up --scale db-worker=3
+  # ────────────────────────────────────────────────────────────
+  db-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: surv-db-worker
+    restart: unless-stopped
+    environment:
+      <<: *env
+    command: python -m workers.db_worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    driver: local

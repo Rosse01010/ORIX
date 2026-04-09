@@ -1,0 +1,66 @@
+# ═══════════════════════════════════════════════════════════════
+# Dockerfile.worker  —  Contenedor de workers (GPU NVIDIA)
+# Incluye TensorFlow GPU, OpenCV y MediaPipe.
+# Requiere nvidia-container-toolkit en el host.
+# ═══════════════════════════════════════════════════════════════
+
+# Base con CUDA 12.2 + cuDNN 8 para compatibilidad con TF 2.17
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    TF_CPP_MIN_LOG_LEVEL=2
+
+# Instalar Python 3.11 y dependencias del sistema
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 \
+        python3.11-dev \
+        python3-pip \
+        # OpenCV / MediaPipe runtime
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+        libgl1 \
+        # RTSP via FFmpeg
+        ffmpeg \
+        # Compilación
+        gcc g++ \
+        libpq-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3 /usr/bin/python
+
+
+# ── Stage: instalación de dependencias Python ────────────────────
+FROM base AS builder
+
+WORKDIR /build
+COPY requirements.txt .
+
+RUN pip install --upgrade pip && \
+    pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+
+# ── Stage final ──────────────────────────────────────────────────
+FROM base
+
+LABEL maintainer="surveillance-team"
+LABEL description="Surveillance Workers — GPU (camera + gpu + db)"
+
+WORKDIR /app
+
+# Copiar dependencias instaladas
+COPY --from=builder /install /usr/local
+
+# Copiar código fuente
+COPY app/      ./app/
+COPY workers/  ./workers/
+COPY models/   ./models/
+
+# Punto de entrada: orquestador de procesos
+# Se puede sobreescribir en docker-compose para correr un worker individual
+CMD ["python", "-m", "workers.main_worker"]

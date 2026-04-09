@@ -1,0 +1,27 @@
+# ── API ─────────────────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+websockets==13.1
+python-multipart==0.0.12
+pydantic-settings==2.6.1
+
+# ── Base de datos ────────────────────────────────────────────────
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+pgvector==0.3.6
+
+# ── Redis ────────────────────────────────────────────────────────
+redis==5.2.0
+
+# ── Computer Vision ──────────────────────────────────────────────
+opencv-python-headless==4.10.0.84
+mediapipe==0.10.18
+numpy==1.26.4
+
+# ── Deep Learning — FaceNet ──────────────────────────────────────
+# Para GPU: reemplazar por tensorflow[and-cuda] o instalar CUDA manualmente
+tensorflow==2.17.0
+
+# ── Utilidades ───────────────────────────────────────────────────
+python-dotenv==1.0.1
