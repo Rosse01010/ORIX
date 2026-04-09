@@ -1,20 +1,24 @@
 """
-Redis Streams consumer that relays detection events to WebSocket clients.
+notifications.py
+────────────────
+Redis Streams consumer that relays detection events to Socket.IO clients.
 
-Runs as a background asyncio task inside the FastAPI process so the API
-stays informed of worker results without polling.
+Reads from stream:events, transforms the payload to the frontend format,
+and emits via Socket.IO:
+  - detection-result  → bounding boxes with names/confidence
+  - alert             → when an unknown face is detected
 """
 from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import redis.asyncio as aioredis
 from structlog import get_logger
 
 from app.config import settings
-from app.websocket.manager import manager
+from app.websocket.socketio_manager import emit_alert, emit_detection
 
 log = get_logger(__name__)
 
@@ -30,16 +34,36 @@ async def _ensure_group(client: aioredis.Redis, stream: str) -> None:
             raise
 
 
+def _transform_bboxes(bboxes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert backend bbox format → frontend BoundingBox format.
+
+    Backend:  {x, y, width, height, name, confidence}
+    Frontend: {x, y, width, height, label, confidence}
+    """
+    return [
+        {
+            "x": b.get("x", 0),
+            "y": b.get("y", 0),
+            "width": b.get("width", 0),
+            "height": b.get("height", 0),
+            "label": b.get("name", "Unknown"),
+            "confidence": b.get("confidence", 0.0),
+        }
+        for b in bboxes
+    ]
+
+
 async def relay_events_task() -> None:
     """
-    Continuously reads from stream:events and broadcasts to WS clients.
-    Should be started as an asyncio background task on app startup.
+    Continuously reads from stream:events and emits to Socket.IO clients.
+    Started as an asyncio background task on API startup.
     """
     client = aioredis.from_url(settings.redis_url, decode_responses=True)
     stream = settings.stream_events
 
     await _ensure_group(client, stream)
-    log.info("ws_notifier_started", stream=stream)
+    log.info("notifications_relay_started", stream=stream)
 
     while True:
         try:
@@ -60,10 +84,10 @@ async def relay_events_task() -> None:
                     await client.xack(stream, CONSUMER_GROUP, msg_id)
 
         except aioredis.ConnectionError:
-            log.warning("ws_notifier_redis_reconnect")
+            log.warning("notifications_redis_reconnect")
             await asyncio.sleep(2)
         except Exception as exc:
-            log.exception("ws_notifier_error", error=str(exc))
+            log.exception("notifications_relay_error", error=str(exc))
             await asyncio.sleep(1)
 
 
@@ -71,9 +95,27 @@ async def _handle_message(fields: Dict[str, str]) -> None:
     try:
         payload: Dict[str, Any] = json.loads(fields.get("payload", "{}"))
         camera_id: str = payload.get("camera", "")
-        if camera_id:
-            await manager.broadcast_to_camera(camera_id, payload)
-        else:
-            await manager.broadcast(payload)
+        bboxes: List[Dict] = payload.get("bboxes", [])
+
+        if not camera_id:
+            return
+
+        boxes = _transform_bboxes(bboxes)
+
+        # Emit detection boxes to subscribed clients
+        if boxes:
+            await emit_detection(camera_id, boxes)
+
+        # Emit alert for every unknown face detected
+        unknown = [b for b in bboxes if b.get("name") == "Unknown"]
+        if unknown:
+            await emit_alert(
+                camera_id=camera_id,
+                alert_type="face-detected",
+                level="warning",
+                message=f"{len(unknown)} unknown face(s) detected",
+                meta={"count": len(unknown)},
+            )
+
     except Exception as exc:
-        log.warning("ws_notifier_bad_msg", error=str(exc))
+        log.warning("notifications_bad_message", error=str(exc))

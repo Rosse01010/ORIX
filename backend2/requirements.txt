@@ -2,6 +2,9 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
+
+# ─── Socket.IO ─────────────────────────────────────────────────────────────────
+python-socketio[asyncio]==5.11.3
 websockets==12.0
 
 # ─── Database ──────────────────────────────────────────────────────────────────
@@ -14,10 +17,14 @@ psycopg2-binary==2.9.9
 # ─── Redis ─────────────────────────────────────────────────────────────────────
 redis[hiredis]==5.0.4
 
+# ─── Auth ──────────────────────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
 # ─── AI / Computer Vision ──────────────────────────────────────────────────────
 insightface==0.7.3
 onnxruntime-gpu==1.18.0
-# Fallback CPU runtime (uncomment if no GPU)
+# Fallback CPU runtime (uncomment if no GPU):
 # onnxruntime==1.18.0
 opencv-python-headless==4.9.0.80
 mediapipe==0.10.14
