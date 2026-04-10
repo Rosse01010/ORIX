@@ -1,12 +1,15 @@
 """
-OSINT Graph API Routes.
+OSINT Graph API Routes (Level 2).
 
-Extends the ORIX API with identity graph endpoints:
+Endpoints:
     POST /api/osint-graph/resolve      - Resolve embedding to identity
-    GET  /api/osint-graph/identity/{id} - Get identity detail
-    POST /api/osint-graph/merge        - Merge two identities
+    GET  /api/osint-graph/identity/{id} - Full identity detail (2-hop graph)
+    GET  /api/osint-graph/graph/{id}    - 2-hop neighborhood of an identity
+    POST /api/osint-graph/merge        - Merge two identities (safety-checked)
     POST /api/osint-graph/enrich       - Add entity links to identity
-    GET  /api/osint-graph/search       - Search identities by embedding
+    POST /api/osint-graph/verify       - Cross-modal truth anchor verification
+    POST /api/osint-graph/search       - Search identities by embedding
+    GET  /api/osint-graph/alerts/volatility - High-drift identities for audit
     GET  /api/osint-graph/stats        - Graph statistics
     POST /api/osint-graph/import       - Import existing ORIX persons
     POST /api/osint-graph/ingest       - Batch ingest embeddings
@@ -17,7 +20,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,20 +38,24 @@ class ResolveRequest(BaseModel):
     image_url: Optional[str] = None
     quality_score: float = Field(1.0, ge=0.0, le=1.0)
     angle_hint: str = "frontal"
+    camera_id: Optional[str] = None
     name_hint: Optional[str] = None
     enrich_entities: bool = False
+    verify_truth: bool = False
 
 
 class ResolveResponse(BaseModel):
     identity_id: Optional[str]
     confidence: float
+    cosine_distance: float = 0.0
     linked_entities: List[Dict[str, Any]] = []
-    graph_neighbors: List[str] = []
+    graph_neighbors: List[Dict[str, Any]] = []
     face_id: Optional[str] = None
     action: Optional[str] = None
     identity_score: Optional[float] = None
     name: Optional[str] = None
     candidates: Optional[List[Dict[str, Any]]] = None
+    verification: Optional[Dict[str, Any]] = None
 
 
 class MergeRequest(BaseModel):
@@ -60,6 +67,12 @@ class MergeRequest(BaseModel):
 class EnrichRequest(BaseModel):
     identity_id: str
     name: str
+
+
+class VerifyRequest(BaseModel):
+    identity_id: str
+    name: str
+    reference_embedding: Optional[List[float]] = None
 
 
 class SearchRequest(BaseModel):
@@ -90,13 +103,12 @@ async def resolve_face(
     db: AsyncSession = Depends(get_db_dep),
 ):
     """
-    Resolve a 512D ArcFace embedding to an identity in the graph.
+    Resolve a 512D ArcFace embedding to an identity.
 
-    The system will:
-    1. Search nearest identity centroids
-    2. Classify similarity (same_identity / candidate_merge / new)
-    3. Create or update identity and face nodes
-    4. Optionally enrich with Wikipedia/Wikidata entities
+    Evidence-based scoring:
+    - cosine_distance < 0.15 + different camera → high confidence auto-merge
+    - cosine_distance 0.15-0.25 → candidate link (no auto-merge)
+    - cosine_distance > 0.25 → new identity created
     """
     engine = GraphEngine(db)
     result = await engine.process_face(
@@ -104,12 +116,15 @@ async def resolve_face(
         image_url=req.image_url,
         quality_score=req.quality_score,
         angle_hint=req.angle_hint,
+        camera_id=req.camera_id,
         name_hint=req.name_hint,
         enrich_entities=req.enrich_entities,
+        verify_truth=req.verify_truth,
     )
     return ResolveResponse(
         identity_id=result.get("identity_id"),
         confidence=result.get("similarity", 0.0),
+        cosine_distance=result.get("cosine_distance", 0.0),
         linked_entities=result.get("linked_entities", []),
         graph_neighbors=result.get("graph_neighbors", []),
         face_id=result.get("face_id"),
@@ -117,6 +132,7 @@ async def resolve_face(
         identity_score=result.get("identity_score"),
         name=result.get("name"),
         candidates=result.get("candidates"),
+        verification=result.get("verification"),
     )
 
 
@@ -125,7 +141,25 @@ async def get_identity(
     identity_id: str,
     db: AsyncSession = Depends(get_db_dep),
 ):
-    """Get full identity detail with linked faces, entities, and graph."""
+    """Get full identity detail with 2-hop graph, entities, and truth anchors."""
+    engine = GraphEngine(db)
+    try:
+        iid = uuid.UUID(identity_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid identity ID")
+
+    result = await engine.get_identity_detail(iid)
+    if not result:
+        raise HTTPException(status_code=404, detail="Identity not found")
+    return result
+
+
+@router.get("/graph/{identity_id}")
+async def get_identity_graph(
+    identity_id: str,
+    db: AsyncSession = Depends(get_db_dep),
+):
+    """Returns the full 2-hop neighborhood of an identity."""
     engine = GraphEngine(db)
     try:
         iid = uuid.UUID(identity_id)
@@ -144,10 +178,8 @@ async def merge_identities(
     db: AsyncSession = Depends(get_db_dep),
 ):
     """
-    Merge two identities into one (admin operation).
-
-    All faces and entity links from source are moved to target.
-    Source identity is deactivated.
+    Merge two identities (admin operation).
+    Safety-checked: refuses if either identity is volatile unless reason='force_merge'.
     """
     engine = GraphEngine(db)
     try:
@@ -158,6 +190,8 @@ async def merge_identities(
 
     result = await engine.merge_identities(src, tgt, req.reason)
     if "error" in result:
+        if result["error"] == "merge_unsafe":
+            raise HTTPException(status_code=409, detail=result)
         raise HTTPException(status_code=404, detail=result["error"])
     return result
 
@@ -167,10 +201,7 @@ async def enrich_identity(
     req: EnrichRequest,
     db: AsyncSession = Depends(get_db_dep),
 ):
-    """
-    Enrich an identity with Wikipedia/Wikidata entity links.
-    Requires a name to search for.
-    """
+    """Enrich identity with Wikipedia/Wikidata entity links."""
     engine = GraphEngine(db)
     try:
         iid = uuid.UUID(req.identity_id)
@@ -180,12 +211,32 @@ async def enrich_identity(
     return await engine.enrich_identity(iid, req.name)
 
 
+@router.post("/verify")
+async def verify_identity(
+    req: VerifyRequest,
+    db: AsyncSession = Depends(get_db_dep),
+):
+    """
+    Cross-modal verification via Wikidata P18 official image.
+    If match similarity >= 0.85, identity is promoted to VERIFIED.
+    """
+    engine = GraphEngine(db)
+    try:
+        iid = uuid.UUID(req.identity_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid identity ID")
+
+    return await engine.verify_identity(
+        iid, req.name, req.reference_embedding
+    )
+
+
 @router.post("/search")
 async def search_identities(
     req: SearchRequest,
     db: AsyncSession = Depends(get_db_dep),
 ):
-    """Search for identities by embedding similarity."""
+    """Search identities by embedding similarity."""
     engine = GraphEngine(db)
     results = await engine.search_identities(
         embedding=req.embedding,
@@ -195,11 +246,30 @@ async def search_identities(
     return {"results": results, "count": len(results)}
 
 
+@router.get("/alerts/volatility")
+async def get_volatility_alerts(
+    min_volatility: float = Query(0.5, ge=0.0, le=1.0),
+    db: AsyncSession = Depends(get_db_dep),
+):
+    """
+    List identities with high embedding drift for audit.
+    Volatility >= 0.5 → needs manual review.
+    Volatility >= 0.7 → critical alert (potential identity collision).
+    """
+    engine = GraphEngine(db)
+    alerts = await engine.get_volatile_identities(min_volatility)
+    return {
+        "alerts": alerts,
+        "count": len(alerts),
+        "threshold": min_volatility,
+    }
+
+
 @router.get("/stats")
 async def get_graph_stats(
     db: AsyncSession = Depends(get_db_dep),
 ):
-    """Get counts of all graph node and edge types."""
+    """Graph statistics including verified/review counts."""
     engine = GraphEngine(db)
     return await engine.get_graph_stats()
 
@@ -208,10 +278,7 @@ async def get_graph_stats(
 async def import_existing_persons(
     db: AsyncSession = Depends(get_db_dep),
 ):
-    """
-    Import all existing ORIX persons into the identity graph.
-    Creates identity nodes, face nodes, and provenance edges.
-    """
+    """Import all existing ORIX persons into the identity graph."""
     builder = GraphBuilder(db)
     return await builder.import_existing_persons()
 
@@ -221,12 +288,7 @@ async def ingest_batch(
     req: IngestRequest,
     db: AsyncSession = Depends(get_db_dep),
 ):
-    """
-    Ingest a batch of pre-computed embeddings into the graph.
-
-    Each embedding item should have:
-        {"embedding": [512 floats], "name": "optional", "labels": ["optional"]}
-    """
+    """Batch ingest pre-computed embeddings into the graph."""
     builder = GraphBuilder(db)
     return await builder.ingest_embedding_batch(
         embeddings=req.embeddings,
@@ -244,9 +306,7 @@ async def create_source(
     """Create a new data source node for provenance tracking."""
     engine = GraphEngine(db)
     source_id = await engine.create_source(
-        source_type=req.source_type,
-        name=req.name,
-        url=req.url,
-        reliability_score=req.reliability_score,
+        source_type=req.source_type, name=req.name,
+        url=req.url, reliability_score=req.reliability_score,
     )
     return {"source_id": source_id}

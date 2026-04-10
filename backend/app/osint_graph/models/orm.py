@@ -1,15 +1,18 @@
 """
-SQLAlchemy ORM models for the OSINT Identity Graph.
+SQLAlchemy ORM models for the OSINT Identity Graph (Level 2).
 
 Tables:
-    graph_face_nodes        - Face observations with 512D embeddings
-    graph_identity_nodes    - Resolved identities (face clusters)
-    graph_entity_nodes      - External entities (Wikipedia, Wikidata, etc.)
-    graph_source_nodes      - Data provenance tracking
-    graph_edges             - Weighted relationships between nodes
+    graph_face_nodes          - Face observations with 512D embeddings
+    graph_identity_nodes      - Resolved identities (face clusters) + stability tracking
+    graph_master_truth_nodes  - Verified OSINT reference embeddings (Wikidata P18, etc.)
+    graph_entity_nodes        - External entities (Wikipedia, Wikidata, etc.)
+    graph_source_nodes        - Data provenance tracking
+    graph_edges               - Weighted relationships between nodes
 
-Uses the existing Base from app.database so all tables are created
-together during init_db().
+Design:
+    Unified PostgreSQL storage — pgvector HNSW for embeddings, adjacency
+    tables for graph edges. Single DB transaction for both vector and
+    graph operations (no split-brain sync issues).
 """
 from __future__ import annotations
 
@@ -29,17 +32,21 @@ from app.database import Base
 # ── Face Node ─────────────────────────────────────────────────────────────────
 
 class GraphFaceNode(Base):
+    """
+    Single detection event: one face in one frame.
+    Carries the raw 512D ArcFace embedding and provenance metadata.
+    """
     __tablename__ = "graph_face_nodes"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    # Embedding stored as JSON text (reuses same pattern as PersonEmbedding)
     embedding_vec: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     image_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     quality_score: Mapped[float] = mapped_column(Float, default=1.0)
     angle_hint: Mapped[str] = mapped_column(String(32), default="frontal")
+    camera_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
 
     # Foreign keys
     identity_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -52,7 +59,6 @@ class GraphFaceNode(Base):
         ForeignKey("graph_source_nodes.id", ondelete="SET NULL"),
         nullable=True, index=True,
     )
-    # Optional link back to existing ORIX person
     person_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("persons.id", ondelete="SET NULL"),
@@ -74,6 +80,13 @@ class GraphFaceNode(Base):
 # ── Identity Node ────────────────────────────────────────────────────────────
 
 class GraphIdentityNode(Base):
+    """
+    Resolved identity — a cluster of face embeddings.
+
+    The centroid is the L2-normalised mean of all assigned face embeddings.
+    Stability metrics track how tightly clustered the identity is and
+    whether it is drifting (potential identity collision).
+    """
     __tablename__ = "graph_identity_nodes"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -84,15 +97,22 @@ class GraphIdentityNode(Base):
         default=lambda: str(uuid.uuid4())[:12],
     )
     name: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
-    # Cluster centroid stored as JSON text
     cluster_center_embedding: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]"
     )
     identity_score: Mapped[float] = mapped_column(Float, default=0.0)
     face_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # ── Stability tracking ───────────────────────────────────────────────────
+    stability_score: Mapped[float] = mapped_column(Float, default=1.0)
+    volatility: Mapped[float] = mapped_column(Float, default=0.0)
+    distinct_cameras: Mapped[int] = mapped_column(Integer, default=0)
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    needs_review: Mapped[bool] = mapped_column(Boolean, default=False)
+
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
-    # Optional link back to existing ORIX person
+
     person_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("persons.id", ondelete="SET NULL"),
@@ -110,10 +130,54 @@ class GraphIdentityNode(Base):
         back_populates="identity", foreign_keys=[GraphFaceNode.identity_id],
         lazy="select",
     )
+    truth_anchors: Mapped[list["GraphMasterTruthNode"]] = relationship(
+        back_populates="identity", lazy="select",
+    )
     entity_links: Mapped[list["GraphEdge"]] = relationship(
         back_populates="source_identity",
         foreign_keys="GraphEdge.source_node_id",
         lazy="select",
+    )
+
+
+# ── Master Truth Node ────────────────────────────────────────────────────────
+
+class GraphMasterTruthNode(Base):
+    """
+    Verified OSINT reference embedding.
+
+    Created when a Wikidata P18 (official image) embedding matches an
+    IdentityNode centroid above the verification threshold (0.85).
+    Serves as a ground-truth anchor for cross-modal verification.
+    """
+    __tablename__ = "graph_master_truth_nodes"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    identity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("graph_identity_nodes.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    reference_embedding: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    external_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    match_similarity: Mapped[float] = mapped_column(Float, default=0.0)
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    identity: Mapped["GraphIdentityNode"] = relationship(
+        back_populates="truth_anchors"
     )
 
 
@@ -167,17 +231,18 @@ class GraphSourceNode(Base):
     )
 
 
-# ── Graph Edge (adjacency table for all relationships) ───────────────────────
+# ── Graph Edge ───────────────────────────────────────────────────────────────
 
 class GraphEdge(Base):
     """
-    Universal edge table for the identity graph.
+    Universal adjacency table for all graph relationships.
 
     edge_type values:
-        face_to_identity    - FaceNode  -> IdentityNode  (similarity_score)
-        identity_to_entity  - IdentityNode -> EntityNode (confidence_score)
-        face_to_source      - FaceNode  -> SourceNode    (provenance_score)
-        identity_to_identity - IdentityNode -> IdentityNode (cluster_similarity)
+        face_to_identity      - (Face)-[:BELONGS_TO]->(Identity)
+        identity_to_entity    - (Identity)-[:LINKED_TO]->(Entity)
+        identity_to_truth     - (Identity)-[:RECOGNIZED_AS]->(MasterTruthNode)
+        face_to_source        - (Face)-[:FROM]->(Source)
+        identity_to_identity  - (Identity)-[:STABILITY_TREND]->(Identity)
     """
     __tablename__ = "graph_edges"
 

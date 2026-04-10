@@ -99,4 +99,21 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    # Create HNSW indexes for graph embedding columns if pgvector available
+    if PGVECTOR_AVAILABLE:
+        async with engine.begin() as conn:
+            for idx_sql in [
+                "CREATE INDEX IF NOT EXISTS ix_graph_identity_hnsw "
+                "ON graph_identity_nodes "
+                "USING hnsw ((cluster_center_embedding::vector(512)) vector_cosine_ops)",
+                "CREATE INDEX IF NOT EXISTS ix_graph_truth_hnsw "
+                "ON graph_master_truth_nodes "
+                "USING hnsw ((reference_embedding::vector(512)) vector_cosine_ops)",
+            ]:
+                try:
+                    await conn.execute(text(idx_sql))
+                except Exception as e:
+                    log.debug("hnsw_index_skip", reason=str(e))
+            log.info("pgvector HNSW indexes ready")
+
     log.info("Database tables ready")

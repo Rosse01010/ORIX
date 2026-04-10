@@ -4,9 +4,7 @@ Dataset Linker — connects faces to public dataset labels.
 Supports linking identities to labels from:
     - LFW (Labeled Faces in the Wild) person names
     - CelebA attribute tags
-    - Custom user-defined labels
-
-All datasets used are publicly available for research purposes.
+    - VGGFace2, WikiFace
 """
 from __future__ import annotations
 
@@ -16,11 +14,10 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.osint_graph.storage.graph_db import GraphDB
+from app.osint_graph.storage.unified_db import UnifiedGraphDB
 
 log = logging.getLogger(__name__)
 
-# Well-known public face datasets
 KNOWN_DATASETS = {
     "lfw": {
         "name": "Labeled Faces in the Wild",
@@ -46,71 +43,39 @@ KNOWN_DATASETS = {
 
 
 class DatasetLinker:
-    """
-    Links face observations and identities to public dataset labels.
-    """
 
     def __init__(self, session: AsyncSession):
         self.session = session
-        self.graph_db = GraphDB(session)
+        self.db = UnifiedGraphDB(session)
 
-    async def create_dataset_source(
-        self, dataset_key: str
-    ) -> Optional[str]:
-        """
-        Create a source node for a known dataset.
-        Returns source_id or None if dataset unknown.
-        """
+    async def create_dataset_source(self, dataset_key: str) -> Optional[str]:
         info = KNOWN_DATASETS.get(dataset_key)
         if not info:
-            log.warning("unknown_dataset", dataset_key=dataset_key)
             return None
-
-        node = await self.graph_db.create_source_node(
-            source_type="dataset",
-            name=info["name"],
-            url=info["url"],
-            reliability_score=info["reliability"],
+        node = await self.db.create_source_node(
+            source_type="dataset", name=info["name"],
+            url=info["url"], reliability_score=info["reliability"],
             metadata={"dataset_key": dataset_key},
         )
         return str(node.id)
 
     async def link_dataset_labels(
-        self,
-        identity_id: uuid.UUID,
-        dataset_key: str,
-        labels: List[str],
+        self, identity_id: uuid.UUID, dataset_key: str, labels: List[str],
     ) -> Dict[str, Any]:
-        """
-        Link dataset labels (e.g., LFW person names) to an identity.
-        Creates entity nodes for each label and edges to the identity.
-        """
         linked = []
         for label in labels:
-            entity = await self.graph_db.create_entity_node(
-                entity_type="dataset",
-                name=label,
+            entity = await self.db.create_entity_node(
+                entity_type="dataset", name=label,
                 description=f"Label from {dataset_key}: {label}",
                 external_id=f"{dataset_key}:{label}",
                 metadata={"dataset": dataset_key, "label": label},
             )
-            await self.graph_db.create_edge(
+            await self.db.create_edge(
                 edge_type="identity_to_entity",
-                source_node_id=identity_id,
-                source_node_type="identity",
-                target_node_id=entity.id,
-                target_node_type="entity",
+                source_node_id=identity_id, source_node_type="identity",
+                target_node_id=entity.id, target_node_type="entity",
                 weight=0.85,
                 metadata={"source": f"{dataset_key}_label"},
             )
-            linked.append({
-                "entity_id": str(entity.id),
-                "label": label,
-                "dataset": dataset_key,
-            })
-
-        return {
-            "identity_id": str(identity_id),
-            "labels_linked": len(linked),
-            "linked": linked,
-        }
+            linked.append({"entity_id": str(entity.id), "label": label, "dataset": dataset_key})
+        return {"identity_id": str(identity_id), "labels_linked": len(linked), "linked": linked}
